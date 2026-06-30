@@ -1,3 +1,7 @@
-from ._native_audio import WasapiCapture
+from ._native_audio import (
+	CaptureStats,
+	WasapiCapture,
+	Window,
+)
 
-__all__ = ["WasapiCapture"]
+__all__ = ["CaptureStats", "WasapiCapture", "Window"]

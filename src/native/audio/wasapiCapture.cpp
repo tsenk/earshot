@@ -4,8 +4,10 @@
 #include <mmdeviceapi.h>
 #include <windows.h>
 
+#include <chrono>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -24,6 +26,11 @@ bool isFloatFormat(const WAVEFORMATEX* f) {
 	}
 
 	return false;
+}
+
+uint64_t nowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
 }
@@ -80,8 +87,12 @@ WasapiCapture::WasapiCapture() : impl(std::make_unique<Impl>()) {
 
 	throwIfFailed(impl->client->GetService(__uuidof(IAudioCaptureClient),
 		reinterpret_cast<void**>(&impl->capture)), "GetService(IAudioCaptureClient)");
-		
+
+	resampler = std::make_unique<Resampler>(impl->mixFormat->nSamplesPerSec, impl->mixFormat->nChannels, 16000, 1);
+
 	buf = std::make_unique<RingBuf>(15*16000);
+
+	windower = std::make_unique<Windower>(*buf);
 }
 
 WasapiCapture::~WasapiCapture() {
@@ -106,6 +117,7 @@ void WasapiCapture::stop() {
 	if (!running.exchange(false))
 		return;
 
+	windower->shutdown();
 	SetEvent(impl->readyEvent);
 
 	if (captureThread.joinable())
@@ -115,37 +127,97 @@ void WasapiCapture::stop() {
 }
 
 void WasapiCapture::captureLoop() {
+	std::vector<float> resampleOut(65536);
+
+	auto lastWakeNs = nowNs();
+
 	while (running.load()) {
 		auto waitResult = WaitForSingleObject(impl->readyEvent, 200);
-		if (waitResult != WAIT_OBJECT_0)
-			continue;
 		if (!running.load())
 			break;
 
-		UINT32 packetSize = 0;
-		auto hr = impl->capture->GetNextPacketSize(&packetSize);
-		while (SUCCEEDED(hr) && packetSize > 0) {
-			BYTE* data = nullptr;
-			UINT32 frames = 0;
-			DWORD flags = 0;
-			hr = impl->capture->GetBuffer(&data, &frames, &flags, nullptr, nullptr);
-			if (SUCCEEDED(hr)) {
-				auto n = static_cast<size_t>(frames)*impl->mixFormat->nChannels;
-				if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT))
-					buf->write(reinterpret_cast<const float*>(data), n);
-				else
-					buf->writeSilence(n);
-				impl->capture->ReleaseBuffer(frames);
+		bool anyArrived = false;
+		bool discontinuityThisWake = false;
+
+		if (waitResult == WAIT_OBJECT_0) {
+			UINT32 packetSize = 0;
+			auto hr = impl->capture->GetNextPacketSize(&packetSize);
+			while (SUCCEEDED(hr) && packetSize > 0) {
+				BYTE* data = nullptr;
+				UINT32 frames = 0;
+				DWORD flags = 0;
+				hr = impl->capture->GetBuffer(&data, &frames, &flags, nullptr, nullptr);
+				if (SUCCEEDED(hr)) {
+					if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) {
+						discontinuityThisWake = true;
+						discontinuityCount.fetch_add(1, std::memory_order_release);
+					}
+
+					auto srcSamples = static_cast<size_t>(frames)*impl->mixFormat->nChannels;
+					auto dstWritten = resampler->process(reinterpret_cast<const float*>(data), srcSamples, resampleOut.data(), resampleOut.size());
+					if (dstWritten > 0) {
+						buf->write(resampleOut.data(), dstWritten);
+						totalWritten.fetch_add(dstWritten, std::memory_order_release);
+					}
+					anyArrived = true;
+
+					impl->capture->ReleaseBuffer(frames);
+				}
+				hr = impl->capture->GetNextPacketSize(&packetSize);
 			}
-			hr = impl->capture->GetNextPacketSize(&packetSize);
 		}
+
+		auto wakeNs = nowNs();
+
+		if (!anyArrived) {
+			// loopback stops signaling events during true silence 200ms wakes us
+			// pad by silence to keep windows on schedule
+			auto owed = (wakeNs-lastWakeNs)*16000/1000000000;
+			if (owed > 15*16000)
+				owed = 15*16000;
+			if (owed > 0) {
+				buf->writeSilence(owed);
+				totalWritten.fetch_add(owed, std::memory_order_release);
+				silencePadEvents.fetch_add(1, std::memory_order_release);
+			}
+		}
+
+		lastWakeNs = wakeNs;
+
+		windower->onSamplesWritten(totalWritten.load(std::memory_order_acquire), wakeNs, discontinuityThisWake);
 	}
 }
 
-void WasapiCapture::readLatestRaw(float* out, size_t n) const {
-	buf->readLatest(out, n);
+Window WasapiCapture::getNextWindow() {
+	return windower->getNext();
 }
 
-uint64_t WasapiCapture::totalSamplesCaptured() const {
-	return buf->total.load(std::memory_order_acquire);
+void WasapiCapture::recordSeconds(uint32_t n, float* out) {
+	if (n == 0)
+		throw std::runtime_error("recordSeconds requires n > 0");
+
+	auto samplesNeeded = static_cast<uint64_t>(n)*16000;
+	auto startTotal = totalWritten.load(std::memory_order_acquire);
+	auto targetTotal = startTotal+samplesNeeded;
+
+	while (running.load()) {
+		auto current = totalWritten.load(std::memory_order_acquire);
+		if (current >= targetTotal)
+			break;
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	}
+
+	if (!running.load())
+		throw std::runtime_error("capture stopped during recordSeconds");
+
+	buf->readLatest(out, samplesNeeded);
+}
+
+CaptureStats WasapiCapture::getStats() const {
+	return CaptureStats{
+		totalWritten.load(std::memory_order_acquire),
+		windower->windowsEmitted(),
+		discontinuityCount.load(std::memory_order_acquire),
+		silencePadEvents.load(std::memory_order_acquire),
+	};
 }

@@ -6,15 +6,38 @@
 namespace nb = nanobind;
 
 NB_MODULE(_native_audio, m) {
+	nb::class_<Window>(m, "Window")
+		.def_ro("startSampleIdx", &Window::startSampleIdx)
+		.def_ro("startTimeNs", &Window::startTimeNs)
+		.def_ro("followsDiscontinuity", &Window::followsDiscontinuity)
+		.def_prop_ro("samples", [](nb::handle_t<Window> self) {
+			auto& w = nb::cast<Window&>(self);
+			return nb::ndarray<float, nb::numpy, nb::shape<80000>, nb::c_contig>(w.samples, {80000}, self);
+		});
+
+	nb::class_<CaptureStats>(m, "CaptureStats")
+		.def_ro("totalSamplesCaptured", &CaptureStats::totalSamplesCaptured)
+		.def_ro("totalWindowsEmitted", &CaptureStats::totalWindowsEmitted)
+		.def_ro("discontinuityCount", &CaptureStats::discontinuityCount)
+		.def_ro("silencePadEvents", &CaptureStats::silencePadEvents);
+
 	nb::class_<WasapiCapture>(m, "WasapiCapture")
 		.def(nb::init<>())
 		.def("start", &WasapiCapture::start)
-		.def("stop", &WasapiCapture::stop)
-		.def("totalSamplesCaptured", &WasapiCapture::totalSamplesCaptured)
-		.def("readLatestRaw", [](const WasapiCapture& self, size_t n) {
-			auto* data = new float[n];
+		.def("stop", &WasapiCapture::stop, nb::call_guard<nb::gil_scoped_release>())
+		.def("getNextWindow", &WasapiCapture::getNextWindow, nb::call_guard<nb::gil_scoped_release>())
+		.def("recordSeconds", [](WasapiCapture& self, uint32_t n) {
+			auto samples = static_cast<size_t>(n)*16000;
+			auto* data = new float[samples];
 			auto capsule = nb::capsule(data, [](void* p) noexcept { delete[] static_cast<float*>(p); });
-			self.readLatestRaw(data, n);
-			return nb::ndarray<float, nb::numpy, nb::c_contig>(data, {n}, capsule);
-		}, nb::arg("n"));
+			try {
+				nb::gil_scoped_release release;
+				self.recordSeconds(n, data);
+			} catch (...) {
+				delete[] data;
+				throw;
+			}
+			return nb::ndarray<float, nb::numpy, nb::c_contig>(data, {samples}, capsule);
+		}, nb::arg("n"))
+		.def("getStats", &WasapiCapture::getStats);
 }
