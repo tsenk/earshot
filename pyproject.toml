@@ -46,7 +46,7 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
-ignore = ["N802", "N803", "N806", "N815", "N816"]
+ignore = ["N802", "N803", "N806", "N815", "N816", "W191"]
 
 [tool.ruff.format]
 indent-style = "tab"

@@ -5,7 +5,7 @@ capture:
 enrollment:
   speaker-count: 4
 
-target-language: cs
+target-language: xxx
 
 thresholds:
   tau-accept: 0.50
