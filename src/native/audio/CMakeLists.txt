@@ -6,6 +6,7 @@ nanobind_add_module(
 	wasapiCapture.cpp
 	resampler.cpp
 	windower.cpp
+	enumerate.cpp
 )
 
 target_link_libraries(_native_audio PRIVATE

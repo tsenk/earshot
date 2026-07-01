@@ -1,6 +1,7 @@
 #include "wasapiCapture.hpp"
 
 #include <audioclient.h>
+#include <audioclientactivationparams.h>
 #include <mmdeviceapi.h>
 #include <windows.h>
 
@@ -53,11 +54,33 @@ struct WasapiCapture::Impl {
 	}
 };
 
-WasapiCapture::WasapiCapture() : impl(std::make_unique<Impl>()) {
+WasapiCapture::WasapiCapture(const CaptureCfg& c) : cfg(c), impl(std::make_unique<Impl>()) {
 	auto hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 	if (FAILED(hr) && hr != RPC_E_CHANGED_MODE)
 		throw std::runtime_error("CoInitializeEx failed");
 
+	if (cfg.type == CaptureType::Desktop)
+		initDesktopLoopback();
+	else
+		initProcessLoopback();
+
+	impl->readyEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+	if (!impl->readyEvent)
+		throw std::runtime_error("CreateEventW failed");
+
+	throwIfFailed(impl->client->SetEventHandle(impl->readyEvent), "SetEventHandle");
+
+	throwIfFailed(impl->client->GetService(__uuidof(IAudioCaptureClient),
+		reinterpret_cast<void**>(&impl->capture)), "GetService(IAudioCaptureClient)");
+
+	resampler = std::make_unique<Resampler>(impl->mixFormat->nSamplesPerSec, impl->mixFormat->nChannels, 16000, 1);
+
+	buf = std::make_unique<RingBuf>(15*16000);
+
+	windower = std::make_unique<Windower>(*buf);
+}
+
+void WasapiCapture::initDesktopLoopback() {
 	throwIfFailed(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
 		__uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&impl->enumerator)), "CoCreateInstance(MMDeviceEnumerator)");
 
@@ -78,21 +101,95 @@ WasapiCapture::WasapiCapture() : impl(std::make_unique<Impl>()) {
 		0,
 		impl->mixFormat,
 		nullptr), "IAudioClient::Initialize");
+}
 
-	impl->readyEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-	if (!impl->readyEvent)
-		throw std::runtime_error("CreateEventW failed");
+void WasapiCapture::initProcessLoopback() {
+	AUDIOCLIENT_ACTIVATION_PARAMS params{};
+	params.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
+	params.ProcessLoopbackParams.TargetProcessId = cfg.pid;
+	params.ProcessLoopbackParams.ProcessLoopbackMode = PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE;
 
-	throwIfFailed(impl->client->SetEventHandle(impl->readyEvent), "SetEventHandle");
+	PROPVARIANT activateParams{};
+	activateParams.vt = VT_BLOB;
+	activateParams.blob.cbSize = sizeof(params);
+	activateParams.blob.pBlobData = reinterpret_cast<BYTE*>(&params);
 
-	throwIfFailed(impl->client->GetService(__uuidof(IAudioCaptureClient),
-		reinterpret_cast<void**>(&impl->capture)), "GetService(IAudioCaptureClient)");
+	struct CompletionHandler : public IActivateAudioInterfaceCompletionHandler {
+		HANDLE event;
+		LONG ref{1};
 
-	resampler = std::make_unique<Resampler>(impl->mixFormat->nSamplesPerSec, impl->mixFormat->nChannels, 16000, 1);
+		HRESULT STDMETHODCALLTYPE ActivateCompleted(IActivateAudioInterfaceAsyncOperation*) override {
+			SetEvent(event);
+			return S_OK;
+		}
+		HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+			if (riid == IID_IUnknown || riid == __uuidof(IActivateAudioInterfaceCompletionHandler) || riid == __uuidof(IAgileObject)) {
+				*ppv = this;
+				AddRef();
+				return S_OK;
+			}
+			return E_NOINTERFACE;
+		}
+		ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref); }
+		ULONG STDMETHODCALLTYPE Release() override {
+			auto n = InterlockedDecrement(&ref);
+			if (n == 0) delete this;
+			return n;
+		}
+	};
 
-	buf = std::make_unique<RingBuf>(15*16000);
+	auto handler = new CompletionHandler();
+	handler->event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
-	windower = std::make_unique<Windower>(*buf);
+	IActivateAudioInterfaceAsyncOperation* op = nullptr;
+	auto hr = ActivateAudioInterfaceAsync(
+		VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+		__uuidof(IAudioClient),
+		&activateParams,
+		handler,
+		&op);
+	if (FAILED(hr)) {
+		CloseHandle(handler->event);
+		handler->Release();
+		throw std::runtime_error("ActivateAudioInterfaceAsync failed, hr=0x" + std::to_string(static_cast<unsigned long>(hr)));
+	}
+
+	WaitForSingleObject(handler->event, INFINITE);
+
+	IUnknown* unk = nullptr;
+	HRESULT activationHr = S_OK;
+	op->GetActivateResult(&activationHr, &unk);
+	op->Release();
+	CloseHandle(handler->event);
+	handler->Release();
+
+	if (FAILED(activationHr))
+		throw std::runtime_error("ActivateAudioInterfaceAsync activation failed (Windows 10 2004+ required)");
+
+	unk->QueryInterface(__uuidof(IAudioClient), reinterpret_cast<void**>(&impl->client));
+	unk->Release();
+
+	// process loopback has no mix format GetMixFormat returns E_NOTIMPL
+	// request a fixed 48k stereo float format
+	auto* f = static_cast<WAVEFORMATEX*>(CoTaskMemAlloc(sizeof(WAVEFORMATEX)));
+	if (!f)
+		throw std::runtime_error("CoTaskMemAlloc failed");
+	f->wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+	f->nChannels = 2;
+	f->nSamplesPerSec = 48000;
+	f->wBitsPerSample = 32;
+	f->nBlockAlign = f->nChannels*f->wBitsPerSample/8;
+	f->nAvgBytesPerSec = f->nSamplesPerSec*f->nBlockAlign;
+	f->cbSize = 0;
+	impl->mixFormat = f;
+
+	throwIfFailed(impl->client->Initialize(
+		AUDCLNT_SHAREMODE_SHARED,
+		AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+		200000,
+		0,
+		impl->mixFormat,
+		nullptr), "IAudioClient::Initialize (process loopback)");
 }
 
 WasapiCapture::~WasapiCapture() {
@@ -132,39 +229,37 @@ void WasapiCapture::captureLoop() {
 	auto lastWakeNs = nowNs();
 
 	while (running.load()) {
-		auto waitResult = WaitForSingleObject(impl->readyEvent, 200);
+		WaitForSingleObject(impl->readyEvent, 200);
 		if (!running.load())
 			break;
 
 		bool anyArrived = false;
 		bool discontinuityThisWake = false;
 
-		if (waitResult == WAIT_OBJECT_0) {
-			UINT32 packetSize = 0;
-			auto hr = impl->capture->GetNextPacketSize(&packetSize);
-			while (SUCCEEDED(hr) && packetSize > 0) {
-				BYTE* data = nullptr;
-				UINT32 frames = 0;
-				DWORD flags = 0;
-				hr = impl->capture->GetBuffer(&data, &frames, &flags, nullptr, nullptr);
-				if (SUCCEEDED(hr)) {
-					if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) {
-						discontinuityThisWake = true;
-						discontinuityCount.fetch_add(1, std::memory_order_release);
-					}
-
-					auto srcSamples = static_cast<size_t>(frames)*impl->mixFormat->nChannels;
-					auto dstWritten = resampler->process(reinterpret_cast<const float*>(data), srcSamples, resampleOut.data(), resampleOut.size());
-					if (dstWritten > 0) {
-						buf->write(resampleOut.data(), dstWritten);
-						totalWritten.fetch_add(dstWritten, std::memory_order_release);
-					}
-					anyArrived = true;
-
-					impl->capture->ReleaseBuffer(frames);
+		UINT32 packetSize = 0;
+		auto hr = impl->capture->GetNextPacketSize(&packetSize);
+		while (SUCCEEDED(hr) && packetSize > 0) {
+			BYTE* data = nullptr;
+			UINT32 frames = 0;
+			DWORD flags = 0;
+			hr = impl->capture->GetBuffer(&data, &frames, &flags, nullptr, nullptr);
+			if (SUCCEEDED(hr)) {
+				if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) {
+					discontinuityThisWake = true;
+					discontinuityCount.fetch_add(1, std::memory_order_release);
 				}
-				hr = impl->capture->GetNextPacketSize(&packetSize);
+
+				auto srcSamples = static_cast<size_t>(frames)*impl->mixFormat->nChannels;
+				auto dstWritten = resampler->process(reinterpret_cast<const float*>(data), srcSamples, resampleOut.data(), resampleOut.size());
+				if (dstWritten > 0) {
+					buf->write(resampleOut.data(), dstWritten);
+					totalWritten.fetch_add(dstWritten, std::memory_order_release);
+				}
+				anyArrived = true;
+
+				impl->capture->ReleaseBuffer(frames);
 			}
+			hr = impl->capture->GetNextPacketSize(&packetSize);
 		}
 
 		auto wakeNs = nowNs();

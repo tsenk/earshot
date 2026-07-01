@@ -9,6 +9,16 @@
 #include <memory>
 #include <thread>
 
+enum class CaptureType {
+	Desktop,
+	Process,
+};
+
+struct CaptureCfg {
+	CaptureType type;
+	uint32_t pid;   // only used when type == Process
+};
+
 struct CaptureStats {
 	uint64_t totalSamplesCaptured;
 	uint64_t totalWindowsEmitted;
@@ -17,7 +27,7 @@ struct CaptureStats {
 };
 
 struct WasapiCapture {
-	WasapiCapture();
+	explicit WasapiCapture(const CaptureCfg& cfg);
 	~WasapiCapture();
 
 	void start();
@@ -43,8 +53,12 @@ private:
 	std::atomic<bool> running{false};
 	std::thread captureThread;
 
+	CaptureCfg cfg;
+
 	struct Impl;
 	std::unique_ptr<Impl> impl;
 
 	void captureLoop();
+	void initDesktopLoopback();
+	void initProcessLoopback();
 };

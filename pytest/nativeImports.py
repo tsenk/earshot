@@ -1,5 +1,9 @@
 def testWasapiCaptureConstructs():
-	from src._native import WasapiCapture
+	from src._native import CaptureCfg, CaptureType, WasapiCapture
 
-	cap = WasapiCapture()
+	cfg = CaptureCfg()
+	cfg.type = CaptureType.Desktop
+	cfg.pid = 0
+
+	cap = WasapiCapture(cfg)
 	assert cap is not None
