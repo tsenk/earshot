@@ -1,5 +1,6 @@
 import signal
 import sys
+import time
 
 import httpx
 from loguru import logger
@@ -7,9 +8,12 @@ from loguru import logger
 from src._native import CaptureCfg, CaptureType, WasapiCapture
 from src.centroids import CentroidDb
 from src.cfg import CfgError, loadCfg
+from src.core import PipelineThread
+from src.display import DisplayState
 from src.enroll import runEnrollment
 from src.log import setupLogging
 from src.models import loadAll
+from src.translation import Translator
 
 
 def _handleSigint(signum, frame) -> None:
@@ -33,6 +37,28 @@ def _buildCaptureCfg(cfg) -> CaptureCfg:
 	nCfg.type = CaptureType.Desktop if cfg.capture.type == "desktop" else CaptureType.Process
 	nCfg.pid = cfg.capture.pid if cfg.capture.pid is not None else 0
 	return nCfg
+
+
+def _renderLine(line, tgtLang: str) -> str:
+	if line.sourceLang == tgtLang:
+		return f"[{line.speakerLabel}] {line.originalText}"
+	return f"[{line.speakerLabel}] ({line.sourceLang}→{tgtLang}) {line.translatedText}"
+
+
+def _inputLoop(displayState: DisplayState, tgtLang: str) -> None:
+	logger.info("entering input loop")
+	while True:
+		time.sleep(0.5)
+		lines, crosstalk, failure = displayState.drainNew()
+
+		for line in lines:
+			print(_renderLine(line, tgtLang), file=sys.stderr, flush=True)
+
+		if crosstalk:
+			print("(crosstalk, accuracy reduced)", file=sys.stderr, flush=True)
+
+		if failure:
+			print("[warning] translation service unreachable", file=sys.stderr, flush=True)
 
 
 def main() -> None:
@@ -82,13 +108,19 @@ def main() -> None:
 		logger.info("enrollment interrupted, exiting")
 		sys.exit(0)
 
-	logger.info("enrollment complete, {} speakers enrolled", len(db.all()))
-	print(f"\nEnrolled {len(db.all())} speaker(s).", file=sys.stderr)
+	print(f"\nEnrolled {len(db.all())} speaker(s). Starting pipeline...\n", file=sys.stderr)
 
-	logger.info("pipeline thread startup skipped")
-	print("Start pipeline thread here", file=sys.stderr)
+	displayState = DisplayState()
+	translator = Translator(cfg.lmStudio.baseUrl, cfg.lmStudio.model)
 
-	print("Flow complete. Exiting.", file=sys.stderr)
+	pipeline = PipelineThread(cap, models, db, translator, cfg, displayState)
+	pipeline.start()
+
+	try:
+		_inputLoop(displayState, cfg.targetLanguage)
+	except KeyboardInterrupt:
+		logger.info("input loop interrupted by KeyboardInterrupt, exiting")
+		sys.exit(0)
 
 
 if __name__ == "__main__":
