@@ -1,15 +1,38 @@
 import signal
 import sys
 
+import httpx
 from loguru import logger
 
+from src._native import CaptureCfg, CaptureType, WasapiCapture
+from src.centroids import CentroidDb
 from src.cfg import CfgError, loadCfg
+from src.enroll import runEnrollment
 from src.log import setupLogging
+from src.models import loadAll
 
 
 def _handleSigint(signum, frame) -> None:
 	logger.info("SIGINT received, exiting")
 	sys.exit(0)
+
+
+def _probeLmStudio(baseUrl: str) -> None:
+	url = baseUrl.rstrip("/") + "/v1/models"
+	logger.info("probing LM Studio at {}", url)
+	try:
+		r = httpx.get(url, timeout=5.0)
+		r.raise_for_status()
+	except Exception as e:
+		raise RuntimeError(f"LM Studio not reachable at {baseUrl} — start it first") from e
+	logger.info("LM Studio reachable")
+
+
+def _buildCaptureCfg(cfg) -> CaptureCfg:
+	nCfg = CaptureCfg()
+	nCfg.type = CaptureType.Desktop if cfg.capture.type == "desktop" else CaptureType.Process
+	nCfg.pid = cfg.capture.pid if cfg.capture.pid is not None else 0
+	return nCfg
 
 
 def main() -> None:
@@ -24,24 +47,48 @@ def main() -> None:
 		print(f"Config error: {e}", file=sys.stderr)
 		sys.exit(1)
 
-	logger.info(
-		"config loaded: capture={} target={} speakerCount={}",
-		cfg.capture.type,
-		cfg.targetLanguage,
-		cfg.enrollment.speakerCount,
-	)
-
 	signal.signal(signal.SIGINT, _handleSigint)
-	logger.debug("SIGINT handler installed")
 
-	logger.info("LM Studio probe skipped")
-	print("Probe LM Studio here", file=sys.stderr)
+	try:
+		_probeLmStudio(cfg.lmStudio.baseUrl)
+	except RuntimeError as e:
+		logger.error("{}", e)
+		print(str(e), file=sys.stderr)
+		sys.exit(1)
 
-	logger.info("model loading skipped")
-	print("Load models here", file=sys.stderr)
+	print("Loading models...", file=sys.stderr)
+	try:
+		models = loadAll(cfg.cudaDeviceIndex)
+	except Exception as e:
+		logger.exception("model loading failed")
+		print(f"Model loading failed: {e}", file=sys.stderr)
+		sys.exit(1)
+	print("Models loaded.", file=sys.stderr)
 
-	logger.info("Startup complete, exiting")
-	print("Startup complete. Exiting.", file=sys.stderr)
+	try:
+		cap = WasapiCapture(_buildCaptureCfg(cfg))
+		cap.start()
+		logger.info("capture started")
+	except Exception as e:
+		logger.exception("capture construction failed")
+		print(f"Capture construction failed: {e}", file=sys.stderr)
+		sys.exit(1)
+
+	db = CentroidDb(cfg.thresholds)
+
+	try:
+		runEnrollment(cap, models.titanet, db, cfg.enrollment.speakerCount)
+	except KeyboardInterrupt:
+		logger.info("enrollment interrupted, exiting")
+		sys.exit(0)
+
+	logger.info("enrollment complete, {} speakers enrolled", len(db.all()))
+	print(f"\nEnrolled {len(db.all())} speaker(s).", file=sys.stderr)
+
+	logger.info("pipeline thread startup skipped")
+	print("Start pipeline thread here", file=sys.stderr)
+
+	print("Flow complete. Exiting.", file=sys.stderr)
 
 
 if __name__ == "__main__":

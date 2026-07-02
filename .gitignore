@@ -8,3 +8,4 @@ __pycache__/
 config.yaml
 logs/
 .venv/
+checkpoints/
