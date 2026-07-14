@@ -11,7 +11,7 @@ Earshot: Fast real-time speech translation (60+ base languages and more with mod
 # Details `TODO`
 <h1 align="center">Contribute</h1>
 
-- See [CONTRIBUTING.md](CONTRIBUTING.md) for dev setup, details and coding guidelines.
+- See [CONTRIBUTING.md](CONTRIBUTING.md) for dev setup, details and coding guidelines. (`TODO`)
 - Since the project is in its infancy, well-documented testing in real use (excluding sensitive discussions) would be invaluable. Ideally, submissions should include original audio recordings for comparison.
 - Bug-hunting and PRs will also be highly appreciated.
 
